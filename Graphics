@@ -1,0 +1,489 @@
+# ============================================================
+# DESCRIPCIÓN DE COHORTE - npx_data2 (OlinkAnalyze)
+# Proteómica por Olink PEA
+# ============================================================
+
+# --- 0. Librerías ----
+library(OlinkAnalyze)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(stringr)
+library(patchwork)
+library(scales)
+
+
+data("npx_data2")
+
+# ============================================================
+# 1. RESUMEN GENERAL DEL DATASET
+# ============================================================
+
+cat("========================================\n")
+cat("  RESUMEN GENERAL\n")
+cat("========================================\n")
+cat("Dimensiones:         ", dim(npx_data2)[1], "filas x", dim(npx_data2)[2], "columnas\n")
+cat("Sujetos únicos:      ", n_distinct(npx_data2$Subject), "\n")
+cat("Muestras únicas:     ", n_distinct(npx_data2$SampleID), "\n")
+cat("Proteínas únicas:    ", n_distinct(npx_data2$OlinkID), "\n")
+cat("Paneles:             ", paste(unique(npx_data2$Panel), collapse = ", "), "\n")
+cat("Proyectos:           ", paste(unique(npx_data2$Project), collapse = ", "), "\n")
+cat("Placas (PlateID):    ", n_distinct(npx_data2$PlateID), "\n\n")
+
+# ============================================================
+# 2. DISEÑO EXPERIMENTAL
+# ============================================================
+
+cat("========================================\n")
+cat("  DISEÑO EXPERIMENTAL\n")
+cat("========================================\n")
+
+# Grupos de tratamiento
+cat("\n-- Grupos de Tratamiento --\n")
+print(table(npx_data2 %>% distinct(Subject, Treatment) %>% pull(Treatment),
+            useNA = "ifany"))
+
+# Puntos de tiempo
+cat("\n-- Puntos de Tiempo --\n")
+print(table(npx_data2 %>% distinct(Subject, Time) %>% pull(Time),
+            useNA = "ifany"))
+
+# Sitios
+cat("\n-- Sitios de Reclutamiento --\n")
+print(table(npx_data2 %>% distinct(Subject, Site) %>% pull(Site),
+            useNA = "ifany"))
+
+# Balance: sujetos por Treatment x Time
+cat("\n-- Balance: Sujetos por Treatment x Time --\n")
+balance <- npx_data2 %>%
+  distinct(Subject, Treatment, Time) %>%
+  count(Treatment, Time)
+print(balance)
+
+
+data("npx_data2")
+
+# Paleta coherente
+col_treated   <- "#2C7BB6"
+col_untreated <- "#D7191C"
+col_na        <- "#BDBDBD"
+col_sites     <- c("#1A9641","#A6D96A","#FDAE61","#F46D43","#D73027")
+
+# ── 1. Treatment ───────────────────────────────────────────
+df_trt <- npx_data2 %>%
+  distinct(Subject, Treatment) %>%
+  mutate(Treatment = ifelse(is.na(Treatment), "NA", Treatment)) %>%
+  count(Treatment) %>%
+  mutate(
+    pct   = n / sum(n) * 100,
+    label = paste0(n, "\n(", round(pct, 1), "%)"),
+    Treatment = factor(Treatment, levels = c("Treated", "Untreated", "NA"))
+  )
+
+p_trt <- ggplot(df_trt, aes(x = Treatment, y = n, fill = Treatment)) +
+  geom_col(width = 0.6, color = "white") +
+  geom_text(aes(label = label), vjust = -0.4, size = 3.5, fontface = "bold") +
+  scale_fill_manual(values = c("Treated" = col_treated,
+                               "Untreated" = col_untreated,
+                               "NA" = col_na)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.2))) +
+  theme_bw(base_size = 11) +
+  theme(legend.position = "none",
+        panel.grid.major.x = element_blank()) +
+  labs(title = "Grupos de Tratamiento", x = NULL, y = "N sujetos")
+
+# ── 2. Time ────────────────────────────────────────────────
+df_time <- npx_data2 %>%
+  distinct(Subject, Time) %>%
+  mutate(Time = ifelse(is.na(Time), "NA", Time)) %>%
+  count(Time) %>%
+  mutate(
+    pct   = n / sum(n) * 100,
+    label = paste0(n, "\n(", round(pct, 1), "%)"),
+    Time  = factor(Time, levels = c("Baseline", "Week.6", "Week.12", "NA"))
+  )
+
+p_time <- ggplot(df_time, aes(x = Time, y = n, fill = Time)) +
+  geom_col(width = 0.6, color = "white") +
+  geom_text(aes(label = label), vjust = -0.4, size = 3.5, fontface = "bold") +
+  scale_fill_manual(values = c("Baseline" = "#4D9DE0",
+                               "Week.6"   = "#3BB273",
+                               "Week.12"  = "#E15554",
+                               "NA"       = col_na)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.2))) +
+  theme_bw(base_size = 11) +
+  theme(legend.position = "none",
+        panel.grid.major.x = element_blank()) +
+  labs(title = "Puntos de Tiempo", x = NULL, y = "N sujetos")
+
+# ── 3. Site ────────────────────────────────────────────────
+df_site <- npx_data2 %>%
+  distinct(Subject, Site) %>%
+  mutate(Site = ifelse(is.na(Site), "NA", Site)) %>%
+  count(Site) %>%
+  mutate(
+    pct   = n / sum(n) * 100,
+    label = paste0(n, "\n(", round(pct, 1), "%)"),
+    Site  = factor(Site, levels = c("Site_A","Site_B","Site_C","Site_D","Site_E","NA"))
+  )
+
+p_site <- ggplot(df_site, aes(x = Site, y = n, fill = Site)) +
+  geom_col(width = 0.6, color = "white") +
+  geom_text(aes(label = label), vjust = -0.4, size = 3.5, fontface = "bold") +
+  scale_fill_manual(values = c(setNames(col_sites,
+                                        c("Site_A","Site_B","Site_C","Site_D","Site_E")),
+                               "NA" = col_na)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.2))) +
+  theme_bw(base_size = 11) +
+  theme(legend.position = "none",
+        panel.grid.major.x = element_blank()) +
+  labs(title = "Sitios de Reclutamiento", x = NULL, y = "N sujetos")
+
+# ── 4. Balance Treatment × Time ───────────────────────────
+df_bal <- npx_data2 %>%
+  distinct(Subject, Treatment, Time) %>%
+  filter(!is.na(Treatment), !is.na(Time)) %>%
+  count(Treatment, Time) %>%
+  mutate(Time = factor(Time, levels = c("Baseline", "Week.6", "Week.12")))
+
+p_bal <- ggplot(df_bal, aes(x = Time, y = n, fill = Treatment, group = Treatment)) +
+  geom_col(position = position_dodge(width = 0.65), width = 0.6, color = "white") +
+  geom_text(aes(label = n),
+            position = position_dodge(width = 0.65),
+            vjust = -0.5, size = 3.5, fontface = "bold") +
+  scale_fill_manual(values = c("Treated" = col_treated, "Untreated" = col_untreated)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.2))) +
+  theme_bw(base_size = 11) +
+  theme(panel.grid.major.x = element_blank(),
+        legend.position = "bottom") +
+  labs(title = "Balance: Sujetos por Treatment × Tiempo",
+       x = NULL, y = "N sujetos", fill = "Grupo")
+
+
+
+
+# ============================================================
+# EVALUACIÓN DE BATCH EFFECT: Before vs After Bridge Norm
+# Comparación por PlateID usando muestras biológicas (sin controles)
+# ============================================================
+
+# ── 0. Preparar datos ──────────────────────────────────────
+# BEFORE: combinar los dos datasets crudos, sin controles
+npx_before <- bind_rows(npx_1, npx_2) %>%
+  filter(!str_detect(SampleID, "CONTROL"))
+
+# AFTER: datos normalizados, sin controles
+npx_after <- npx_br_data %>%
+  filter(!str_detect(SampleID, "CONTROL"))
+
+# ── 1. BOXPLOT NPX por PlateID — Before vs After ───────────
+# Mediana global para línea de referencia
+med_before <- median(npx_before$NPX, na.rm = TRUE)
+med_after  <- median(npx_after$NPX,  na.rm = TRUE)
+
+p_box_before <- ggplot(npx_before, aes(x = PlateID, y = NPX, fill = Project)) +
+  geom_boxplot(outlier.size = 0.3, alpha = 0.8, width = 0.6) +
+  geom_hline(yintercept = med_before, linetype = "dashed",
+             color = "black", linewidth = 0.6) +
+  scale_fill_manual(values = c("data1" = "#2C7BB6", "data2" = "#D7191C")) +
+  theme_bw(base_size = 10) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom") +
+  labs(title = "BEFORE Bridge Normalization",
+       subtitle = "Distribución NPX por PlateID",
+       x = "PlateID", y = "NPX (log2)", fill = "Proyecto")
+
+p_box_after <- ggplot(npx_after, aes(x = PlateID, y = NPX, fill = Project)) +
+  geom_boxplot(outlier.size = 0.3, alpha = 0.8, width = 0.6) +
+  geom_hline(yintercept = med_after, linetype = "dashed",
+             color = "black", linewidth = 0.6) +
+  scale_fill_manual(values = c("data1" = "#2C7BB6", "data2" = "#D7191C")) +
+  theme_bw(base_size = 10) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom") +
+  labs(title = "AFTER Bridge Normalization",
+       subtitle = "Distribución NPX por PlateID",
+       x = "PlateID", y = "NPX (log2)", fill = "Proyecto")
+
+
+# ── 2. DENSIDAD NPX por Proyecto — Before vs After ─────────
+# Más fácil de leer para ver desplazamiento entre proyectos
+p_dens_before <- ggplot(npx_before, aes(x = NPX, color = Project, fill = Project)) +
+  geom_density(alpha = 0.25, linewidth = 0.8) +
+  scale_color_manual(values = c("data1" = "#2C7BB6", "data2" = "#D7191C")) +
+  scale_fill_manual(values  = c("data1" = "#2C7BB6", "data2" = "#D7191C")) +
+  theme_bw(base_size = 11) +
+  theme(legend.position = "bottom") +
+  labs(title = "BEFORE", x = "NPX (log2)", y = "Densidad", color = "Proyecto", fill = "Proyecto")
+
+p_dens_after <- ggplot(npx_after, aes(x = NPX, color = Project, fill = Project)) +
+  geom_density(alpha = 0.25, linewidth = 0.8) +
+  scale_color_manual(values = c("data1" = "#2C7BB6", "data2" = "#D7191C")) +
+  scale_fill_manual(values  = c("data1" = "#2C7BB6", "data2" = "#D7191C")) +
+  theme_bw(base_size = 11) +
+  theme(legend.position = "bottom") +
+  labs(title = "AFTER", x = "NPX (log2)", y = "Densidad", color = "Proyecto", fill = "Proyecto")
+
+
+# ── 3. SCATTER de bridging samples: data1 vs data2 ─────────
+# La prueba más directa: ¿las muestras puente tienen mismo NPX en ambos proyectos?
+
+scatter_before <- bind_rows(npx_1, npx_2) %>%
+  filter(SampleID %in% overlap_samples) %>%
+  filter(!str_detect(SampleID, "CONTROL")) %>%
+  select(SampleID, OlinkID, NPX, Project) %>%
+  tidyr::pivot_wider(names_from = Project, values_from = NPX,
+                     values_fn = mean) %>%   # por si hay duplicados
+  filter(!is.na(data1), !is.na(data2))
+
+scatter_after <- npx_br_data %>%
+  filter(SampleID %in% overlap_samples) %>%
+  filter(!str_detect(SampleID, "CONTROL")) %>%
+  select(SampleID, OlinkID, NPX, Project) %>%
+  tidyr::pivot_wider(names_from = Project, values_from = NPX,
+                     values_fn = mean) %>%
+  filter(!is.na(data1), !is.na(data2))
+
+# Correlación
+r_before <- round(cor(scatter_before$data1, scatter_before$data2,
+                      use = "complete.obs"), 3)
+r_after  <- round(cor(scatter_after$data1,  scatter_after$data2,
+                      use = "complete.obs"), 3)
+
+p_sc_before <- ggplot(scatter_before, aes(x = data1, y = data2)) +
+  geom_point(alpha = 0.4, size = 1.2, color = "#555555") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              color = "red", linewidth = 0.7) +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.2, vjust = 1.5,
+           label = paste0("r = ", r_before), size = 4, fontface = "bold") +
+  theme_bw(base_size = 11) +
+  labs(title = "BEFORE — Bridging Samples",
+       x = "NPX data1", y = "NPX data2")
+
+p_sc_after <- ggplot(scatter_after, aes(x = data1, y = data2)) +
+  geom_point(alpha = 0.4, size = 1.2, color = "#2C7BB6") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              color = "red", linewidth = 0.7) +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.2, vjust = 1.5,
+           label = paste0("r = ", r_after), size = 4, fontface = "bold") +
+  theme_bw(base_size = 11) +
+  labs(title = "AFTER — Bridging Samples",
+       x = "NPX data1", y = "NPX data2 (normalizado)")
+
+
+# ── 4. TABLA RESUMEN numérica ───────────────────────────────
+cat("\n========================================\n")
+cat("  RESUMEN CUANTITATIVO DEL BATCH EFFECT\n")
+cat("========================================\n")
+
+resumen_batch <- bind_rows(
+  npx_before %>%
+    group_by(Project) %>%
+    summarise(mediana_NPX = round(median(NPX, na.rm=TRUE), 3),
+              sd_NPX      = round(sd(NPX,     na.rm=TRUE), 3),
+              .groups = "drop") %>%
+    mutate(Momento = "Before"),
+  npx_after %>%
+    group_by(Project) %>%
+    summarise(mediana_NPX = round(median(NPX, na.rm=TRUE), 3),
+              sd_NPX      = round(sd(NPX,     na.rm=TRUE), 3),
+              .groups = "drop") %>%
+    mutate(Momento = "After")
+) %>%
+  select(Momento, Project, mediana_NPX, sd_NPX) %>%
+  arrange(Momento, Project)
+
+print(resumen_batch)
+
+
+
+####VOLCANO PLOT
+# ============================================================
+# VOLCANO PLOT MEJORADO — DEP Olink
+# Modelo 3: Treatment:Time interaction
+# Sin olink_volcano_plot — construido desde cero con ggplot2
+# ============================================================
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+
+# ============================================================
+# BLOQUE 1 — Post-hoc para obtener estimate (dirección)
+# ============================================================
+
+posthoc_M3 <- olink_lmer_posthoc(
+  df                      = npx_model,
+  olinkid_list            = NULL,
+  variable                = c("Treatment", "Time"),
+  random                  = "Subject",
+  covariates              = "Site",
+  effect                  = "Treatment",
+  post_hoc_padjust_method = "BH",
+  verbose                 = FALSE
+)
+
+cat("Columnas post-hoc:\n"); print(colnames(posthoc_M3))
+cat("\nPrimeras filas:\n"); print(head(posthoc_M3, 4))
+
+# ============================================================
+# BLOQUE 2 — Preparar datos del volcano
+# ============================================================
+
+# El post-hoc da una fila por comparación por proteína
+# Nos quedamos solo con Treated - Untreated (la comparación de interés)
+volcano_df <- posthoc_M3 %>%
+  filter(str_detect(contrast, "Treated") & str_detect(contrast, "Untreated")) %>%
+  filter(!is.na(estimate), !is.na(Adjusted_pval)) %>%
+  mutate(
+    log10p = -log10(Adjusted_pval),
+    
+    # Clasificación up / down / NS
+    Categoria = case_when(
+      Adjusted_pval < 0.05 & estimate > 0 ~ "Positive",
+      Adjusted_pval < 0.05 & estimate < 0 ~ "Negative",
+      TRUE                                    ~ "Insignificant"
+    ),
+    Categoria = factor(Categoria,
+                       levels = c("Positive", "Negative", "Insignificant")),
+    
+    # Label solo para significativos
+    Label   = ifelse(Adjusted_pval < 0.05, Assay, NA_character_),
+    pt_size = ifelse(Adjusted_pval < 0.05, 2.8, 1.8)
+  )
+
+# Conteos
+n_pos <- sum(volcano_df$Categoria == "Positive",      na.rm = TRUE)
+n_neg <- sum(volcano_df$Categoria == "Negative",      na.rm = TRUE)
+n_ns  <- sum(volcano_df$Categoria == "Insignificant", na.rm = TRUE)
+
+cat("\n═══════════════════════════════════\n")
+cat("  VOLCANO — Treatment (post-hoc)\n")
+cat("═══════════════════════════════════\n")
+cat("Positive (Treated↑):", n_pos, "\n")
+cat("Negative (Treated↓):", n_neg, "\n")
+cat("Insignificant:      ", n_ns,  "\n")
+
+# Límites simétricos eje X
+x_abs <- max(abs(volcano_df$estimate), na.rm = TRUE) * 1.15
+y_max <- max(volcano_df$log10p,         na.rm = TRUE) * 1.12
+fdr_y <- -log10(0.05)
+
+# ============================================================
+# BLOQUE 3 — Tema blanco estilo publicación
+# ============================================================
+
+tema_blanco <- theme_classic(base_size = 13) +
+  theme(
+    plot.background   = element_rect(fill = "white", color = NA),
+    panel.background  = element_rect(fill = "white", color = NA),
+    panel.grid.major  = element_line(color = "#F0F0F0", linewidth = 0.4),
+    panel.grid.minor  = element_blank(),
+    axis.line         = element_line(color = "#333333", linewidth = 0.7),
+    axis.ticks        = element_line(color = "#333333", linewidth = 0.5),
+    axis.text         = element_text(color = "#333333", size = 11),
+    axis.title        = element_text(color = "#111111", size = 12, face = "bold"),
+    plot.title        = element_text(color = "#111111", size = 15, face = "bold",
+                                     margin = margin(b = 4)),
+    plot.subtitle     = element_text(color = "#666666", size = 9.5,
+                                     margin = margin(b = 14)),
+    plot.caption      = element_text(color = "#999999", size = 8,
+                                     hjust = 0, margin = margin(t = 10)),
+    plot.margin       = margin(20, 24, 14, 20),
+    legend.background = element_rect(fill = "white", color = "#CCCCCC",
+                                     linewidth = 0.4),
+    legend.key        = element_rect(fill = NA),
+    legend.text       = element_text(color = "#333333", size = 10),
+    legend.title      = element_blank(),
+    legend.position   = c(0.88, 0.80),
+    legend.margin     = margin(8, 12, 8, 12)
+  )
+
+# ============================================================
+# BLOQUE 4 — Plot
+# ============================================================
+
+p_volcano <- ggplot(volcano_df,
+                    aes(x = estimate, y = log10p,
+                        color = Categoria, size = Categoria)) +
+  
+  # ── Líneas de referencia
+  geom_hline(yintercept = fdr_y,
+             linetype = "dashed", color = "#AAAAAA", linewidth = 0.6) +
+  geom_vline(xintercept = 0,
+             linetype = "solid",  color = "#DDDDDD", linewidth = 0.6) +
+  
+  # ── Puntos NS primero (fondo)
+  geom_point(data = filter(volcano_df, Categoria == "Insignificant"),
+             alpha = 0.55, shape = 16) +
+  
+  # ── Puntos significativos encima
+  geom_point(data = filter(volcano_df, Categoria != "Insignificant"),
+             alpha = 0.88, shape = 16) +
+  
+  # ── Labels con ggrepel
+  geom_text_repel(
+    aes(label = Label),
+    color         = "#111111",
+    size          = 2.9,
+    fontface      = "bold",
+    family        = "mono",
+    box.padding   = 0.5,
+    point.padding = 0.25,
+    segment.color = "#AAAAAA",
+    segment.size  = 0.35,
+    max.overlaps  = 30,
+    na.rm         = TRUE
+  ) +
+  
+  # ── Anotación n en esquinas
+  annotate("text",
+           x = -x_abs * 0.92, y = y_max * 0.97,
+           label = paste0("Negative\nn = ", n_neg),
+           color = "#2779B5", size = 3.2, hjust = 0, fontface = "bold") +
+  annotate("text",
+           x =  x_abs * 0.92, y = y_max * 0.97,
+           label = paste0("Positive\nn = ", n_pos),
+           color = "#E07B30", size = 3.2, hjust = 1, fontface = "bold") +
+  
+  # ── Label línea FDR
+  annotate("text",
+           x = x_abs * 0.92, y = fdr_y + y_max * 0.022,
+           label = "FDR = 0.05",
+           color = "#AAAAAA", size = 2.6, hjust = 1, family = "mono") +
+  
+  # ── Escalas
+  scale_color_manual(
+    values = c(
+      "Positive"     = "#E07B30",
+      "Negative"     = "#2779B5",
+      "Insignificant" = "#AAAAAA"
+    )
+  ) +
+  scale_size_manual(
+    values = c("Positive" = 2.8, "Negative" = 2.8, "Insignificant" = 1.8),
+    guide  = "none"
+  ) +
+  scale_x_continuous(
+    limits = c(-x_abs, x_abs),
+    labels = function(x) sprintf("%+.0f", x)
+  ) +
+  scale_y_continuous(
+    limits = c(0, y_max),
+    expand = expansion(mult = c(0, 0.05))
+  ) +
+  
+  labs(
+    title    = "Expresión Diferencial de Proteínas",
+    subtitle = paste0(
+      "Modelo: NPX ~ Treatment × Time + Site + (1|Subject)   ·   post-hoc: Treated vs Untreated   ·   ",
+      n_pos + n_neg, " significativas (FDR < 0.05)"
+    ),
+    x       = expression(Fold~change~(log[2])),
+    y       = expression(-log[10](P~value)),
+    color   = NULL,
+    caption = "OlinkAnalyze · lmerTest · emmeans · BH correction"
+  ) +
+  
+  tema_blanco +
+  coord_cartesian(clip = "off")
+
