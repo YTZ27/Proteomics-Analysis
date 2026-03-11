@@ -1,0 +1,733 @@
+# =============================================================================
+# PIPELINE DE ANÁLISIS PROTEÓMICO - OLINK TARGET 96
+# Autor: YTZ
+# Fecha: 2026
+# Descripción: Pipeline  de normalización por bridging, control de
+#              calidad, filtrado de proteínas y expresión diferencial usando
+#              datos de NPX de Olink.
+# =============================================================================
+# ESTRUCTURA DEL PIPELINE:
+#   1. Librerias
+#   2. Carga de datos
+#   3. Exploración pre-normalización
+#   4. Bridge normalization
+#   5. Exploración post-normalización
+#   6. Filtrado de proteínas (LOD + SD)
+#   7. Control de calidad de muestras (detección de outliers)
+#   8. Expresión diferencial (modelos lineales mixtos)
+# =============================================================================
+
+
+# =============================================================================
+# 1. Librerias
+# =============================================================================
+
+setwd("~/OneDrive - Seguros Suramericana, S.A/Documentos/PROTEOMICA/USCB")
+
+library(OlinkAnalyze)
+library(readxl)
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(stringr)
+library(corrplot)
+library(umap)
+library(lme4)
+library(lmerTest)
+
+
+# =============================================================================
+# 2. CARGA DE DATOS
+# =============================================================================
+
+# npx_data1 y npx_data2 son los datasets crudos de Olink
+data("npx_data1")
+data("npx_data2")
+
+
+# Verificar variables de diseño y su distribución
+lapply(
+  npx_data2 %>% dplyr::select(Treatment, Time, Site, Project, Panel, QC_Warning),
+  function(x) table(x, useNA = "ifany")
+)
+
+cat("\nN sujetos únicos:", n_distinct(npx_data2$Subject), "\n")
+cat("N proteínas únicas:", n_distinct(npx_data2$OlinkID), "\n")
+
+# --- Remover controles internos de corrida ---
+# Los CONTROL_SAMPLE son controles técnicos de Olink, no muestras biológicas, Se remueven para todos los análisis exploratorios y de normalización
+
+npx_sin_controles <- npx_data2 %>%
+  dplyr::filter(!str_detect(SampleID, "CONTROL_SAMPLE"))
+
+
+# =============================================================================
+# 3. EXPLORACIÓN PRE-NORMALIZACIÓN
+# =============================================================================
+# Objetivo: identificar efectos de batch entre placas antes de corregir.
+
+# --- PCA por advertencia de QC ---
+olink_pca_plot(npx_sin_controles, color_g = "QC_Warning")
+
+# --- PCA por placa: detectar batch effect entre placas ---
+olink_pca_plot(npx_sin_controles, color_g = "PlateID")
+
+# --- Distribución de NPX por muestra: detectar muestras con distribución atípica ---
+olink_dist_plot(npx_sin_controles)
+
+# --- Matriz de correlación entre muestras ---
+# Alta correlación esperada (>0.95) entre muestras del mismo proyecto/placa.
+# Muestras con correlación baja pueden ser outliers técnicos.
+
+npx_wide_corr <- npx_sin_controles %>%
+  dplyr::select(SampleID, Assay, NPX) %>%
+  pivot_wider(names_from = SampleID, values_from = NPX) %>%
+  column_to_rownames("Assay")
+
+cor_matrix <- cor(npx_wide_corr, use = "pairwise.complete.obs")
+
+corrplot(cor_matrix,
+         method   = "color",
+         tl.pos   = "n",
+         title    = "Correlación entre muestras (pre-normalización)")
+
+
+# --- Preparar datasets con etiqueta de proyecto para comparación ---
+npx_1 <- npx_data1 %>% dplyr::mutate(Project = "data1")
+npx_2 <- npx_data2 %>% dplyr::mutate(Project = "data2")
+
+
+# --- Identificar muestras bridge (compartidas entre proyectos) ---
+# Las bridge samples son las muestras medidas en AMBAS corridas/placas.
+# Se usan como referencia para estimar el factor de ajuste entre proyectos.
+bridge_samples_ids <- intersect(npx_1$SampleID, npx_2$SampleID) %>%
+  stringr::str_subset("CONTROL", negate = TRUE)
+
+cat("\nMuestras bridge identificadas:", length(bridge_samples_ids), "\n")
+print(bridge_samples_ids)
+
+# --- Distribución NPX antes de normalización (por proyecto y panel) ---
+bind_rows(npx_1, npx_2) %>%
+  dplyr::mutate(Panel = gsub("Olink ", "", Panel)) %>%
+  ggplot(aes(x = NPX, fill = Project)) +
+  geom_density(alpha = 0.4) +
+  facet_grid(~Panel) +
+  olink_fill_discrete(coloroption = c("red", "darkblue")) +
+  set_plot_theme() +
+  ggtitle("Antes de bridge normalization: distribución NPX") +
+  theme(
+    axis.title.x    = element_blank(),
+    axis.title.y    = element_blank(),
+    strip.text      = element_text(size = 16),
+    legend.title    = element_blank(),
+    legend.position = "top"
+  )
+
+# --- PCA pre-normalización ---
+npx_before_br <- bind_rows(
+  npx_1 %>%
+    dplyr::filter(!str_detect(SampleID, "CONTROL_SAMPLE")) %>%
+    dplyr::mutate(
+      Type = if_else(SampleID %in% bridge_samples_ids, "data1 Bridge", "data1 Sample")
+    ),
+  npx_2 %>%
+    dplyr::filter(!str_detect(SampleID, "CONTROL_SAMPLE")) %>%
+    dplyr::mutate(
+      Type      = if_else(SampleID %in% bridge_samples_ids, "data2 Bridge", "data2 Sample"),
+      # Renombrar bridges de data2 para evitar SampleIDs duplicados en el pivot
+      SampleID  = if_else(SampleID %in% bridge_samples_ids, paste0(SampleID, "_new"), SampleID)
+    )
+)
+
+# Función interna: calcula PCA por panel y devuelve coordenadas listas para graficar
+hacer_pca_panel <- function(datos, nombre_panel) {
+  
+  df <- datos %>%
+    dplyr::filter(Panel == nombre_panel) %>%
+    dplyr::select(SampleID, Type, Assay, NPX) %>%
+    tidyr::pivot_wider(names_from = Assay, values_from = NPX)
+  
+  # Imputar NAs con la mediana por proteína (más robusto que la media para NPX)
+  mat <- df %>%
+    dplyr::select(-SampleID, -Type) %>%
+    dplyr::mutate(across(everything(), ~ifelse(is.na(.), median(., na.rm = TRUE), .)))
+  
+  pca <- prcomp(mat, center = TRUE, scale. = TRUE)
+  
+  var1 <- round(summary(pca)$importance[2, 1] * 100, 2)
+  var2 <- round(summary(pca)$importance[2, 2] * 100, 2)
+  
+  data.frame(
+    SampleID = df$SampleID,
+    Type     = df$Type,
+    PC1      = pca$x[, 1],
+    PC2      = pca$x[, 2],
+    Panel    = nombre_panel,
+    PC1_lab  = paste0("PC1 (", var1, "%)"),
+    PC2_lab  = paste0("PC2 (", var2, "%)")
+  )
+}
+
+# Correr PCA por panel y unir resultados
+pca_cardio <- hacer_pca_panel(npx_before_br, "Olink Cardiometabolic")
+pca_inflam <- hacer_pca_panel(npx_before_br, "Olink Inflammation")
+pca_coords_pre <- rbind(pca_cardio, pca_inflam) %>%
+  dplyr::mutate(Dataset = ifelse(grepl("data1", Type), "data1", "data2"))
+
+# Plot PCA pre-normalización
+ggplot(pca_coords_pre, aes(x = PC1, y = PC2, color = Type, fill = Dataset)) +
+  geom_point(size = 3, alpha = 0.7) +
+  stat_ellipse(aes(group = Dataset), geom = "polygon", alpha = 0.15, level = 0.95) +
+  stat_ellipse(aes(group = Dataset, color = Dataset), level = 0.95, linewidth = 1) +
+  facet_wrap(~Panel, scales = "free") +
+  scale_color_manual(values = c(
+    "data1 Bridge" = "#00BCD4",
+    "data1 Sample" = "#E53935",
+    "data2 Bridge" = "#1A237E",
+    "data2 Sample" = "#FFA000",
+    "data1"        = "#E53935",
+    "data2"        = "#FFA000"
+  )) +
+  scale_fill_manual(values = c("data1" = "#E53935", "data2" = "#FFA000")) +
+  labs(
+    title = "PCA antes de bridge normalization",
+    color = "Tipo",
+    fill  = "Dataset"
+  ) +
+  theme_bw() +
+  theme(legend.position = "top")
+
+
+# =============================================================================
+# 4. BRIDGE NORMALIZATION
+# =============================================================================
+# La bridge normalization corrige diferencias sistemáticas entre corridas/placas
+# usando muestras presentes en ambas como referencia.
+
+# Preparar lista de bridge samples en el formato requerido por olink_normalization_bridge
+bridge_samples_list <- list(
+  "DF1" = bridge_samples_ids,
+  "DF2" = bridge_samples_ids
+)
+
+
+# Ejecutar normalización
+npx_br_data <- olink_normalization_bridge(
+  project_1_df   = npx_1,
+  project_2_df   = npx_2,
+  bridge_samples = bridge_samples_list,
+  project_1_name = "data1",
+  project_2_name = "data2",
+  project_ref_name = "data1"   # data1 como referencia: data2 se ajusta hacia data1
+)
+
+# Verificar output
+cat("\n=== Output bridge normalization ===\n")
+cat("Dimensiones:", dim(npx_br_data), "\n")
+cat("Columnas:", paste(colnames(npx_br_data), collapse = ", "), "\n")
+
+# Verificar que los controles estén presentes en el dato normalizado
+# (necesario para calcular CV post-normalización)
+n_controles_post <- npx_br_data %>%
+  dplyr::filter(str_detect(SampleID, "CONTROL")) %>%
+  nrow()
+cat("\nRegistros de CONTROL en npx_br_data:", n_controles_post, "\n")
+cat("(Si es 0, el CV post-normalización no puede calcularse con controles)\n")
+
+
+# =============================================================================
+# 5. EXPLORACIÓN POST-NORMALIZACIÓN
+# =============================================================================
+npx_before_plot <- bind_rows(npx_1, npx_2) %>%
+  dplyr::mutate(Stage = "Antes", Panel = gsub("Olink ", "", Panel))
+
+npx_after_plot <- npx_br_data %>%
+  dplyr::mutate(Stage = "Después", Panel = gsub("Olink ", "", Panel))
+
+bind_rows(npx_before_plot, npx_after_plot) %>%
+  dplyr::mutate(Stage = factor(Stage, levels = c("Antes", "Después"))) %>%
+  ggplot(aes(x = NPX, fill = Project)) +
+  geom_density(alpha = 0.4) +
+  facet_grid(Stage ~ Panel) +
+  olink_fill_discrete(coloroption = c("red", "darkblue")) +
+  set_plot_theme() +
+  ggtitle("Bridge normalization: antes vs después") +
+  theme(
+    legend.position = "top",
+    legend.title    = element_blank(),
+    strip.text      = element_text(size = 14)
+  )
+
+# --- Coeficiente de variación (CV) antes y después de normalización ---
+# El CV mide la variabilidad técnica entre controles.
+# Un CV menor post-normalización indica que la corrección fue efectiva.
+
+# Función CV para Target 96 (escala lineal 2^NPX)
+t96_cv <- function(NPX, na.rm = TRUE) {
+  100 * sd(2^NPX, na.rm = na.rm) / mean(2^NPX, na.rm = na.rm)
+}
+
+cv_before <- bind_rows(npx_1, npx_2) %>%
+  dplyr::filter(str_detect(SampleID, "CONTROL")) %>%
+  dplyr::filter(NPX > LOD) %>%
+  dplyr::group_by(OlinkID) %>%
+  dplyr::mutate(CV = t96_cv(NPX)) %>%
+  dplyr::ungroup() %>%
+  dplyr::distinct(OlinkID, CV)
+
+# CV post: solo calcular si hay controles en npx_br_data
+if (n_controles_post > 0) {
+  cv_after <- npx_br_data %>%
+    dplyr::filter(str_detect(SampleID, "CONTROL")) %>%
+    dplyr::filter(NPX > LOD) %>%
+    dplyr::group_by(OlinkID) %>%
+    dplyr::mutate(CV = t96_cv(NPX)) %>%
+    dplyr::ungroup() %>%
+    dplyr::distinct(OlinkID, CV)
+  
+  cv_combined <- cv_before %>%
+    dplyr::rename(CV_before = CV) %>%
+    dplyr::inner_join(cv_after %>% dplyr::rename(CV_after = CV), by = "OlinkID") %>%
+    dplyr::mutate(
+      Mejora  = CV_before - CV_after,
+      Mejoró  = ifelse(CV_after < CV_before, "Sí", "No")
+    )
+  
+  resumen_cv <- cv_combined %>%
+    dplyr::summarise(
+      Mediana_CV_Before       = round(median(CV_before, na.rm = TRUE), 2),
+      Mediana_CV_After        = round(median(CV_after,  na.rm = TRUE), 2),
+      Mejora_mediana          = round(median(Mejora,    na.rm = TRUE), 2),
+      Pct_proteinas_mejoraron = round(mean(Mejoró == "Sí") * 100, 1)
+    )
+  print(resumen_cv)
+  
+  ggplot(cv_combined, aes(x = CV_before, y = CV_after, color = Mejoró)) +
+    geom_point(alpha = 0.7, size = 2.5) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray40") +
+    annotate("text",
+             x     = max(cv_combined$CV_before, na.rm = TRUE) * 0.6,
+             y     = max(cv_combined$CV_after,  na.rm = TRUE) * 0.95,
+             label = paste0(
+               "Mediana Before: ", resumen_cv$Mediana_CV_Before,
+               "\nMediana After: ",  resumen_cv$Mediana_CV_After,
+               "\n% mejoraron: ",    resumen_cv$Pct_proteinas_mejoraron, "%"
+             ),
+             hjust = 0, size = 4.5, color = "black") +
+    scale_color_manual(values = c("Sí" = "#2196F3", "No" = "#E53935")) +
+    labs(
+      title = "CV por proteína: antes vs después de bridge normalization",
+      x     = "CV Before",
+      y     = "CV After",
+      color = "¿Mejoró?"
+    ) +
+    theme_bw() +
+    theme(legend.position = "top")
+  
+} else {
+  cat("\nAVISO: No se encontraron controles en npx_br_data.\n")
+  cat("El CV post-normalización no puede calcularse. Verificar output de olink_normalization_bridge.\n")
+}
+
+
+# PCA post-normalización ---
+# Preparar datos post-bridge con etiquetas de tipo
+npx_after_br <- npx_br_data %>%
+  dplyr::mutate(
+    Type     = ifelse(SampleID %in% bridge_samples_ids,
+                      paste(Project, "Bridge"),
+                      paste(Project, "Sample")),
+    # Crear SampleID único combinando proyecto + placa + muestra
+    # Esto evita colisiones entre proyectos al hacer pivot_wider
+    SampleID = paste0(Project, PlateID, SampleID)
+  )
+
+# Verificar que no haya SampleIDs duplicados después del paste
+n_dup <- npx_after_br %>%
+  dplyr::filter(!is.na(NPX)) %>%
+  dplyr::count(SampleID, Assay) %>%
+  dplyr::filter(n > 1) %>%
+  nrow()
+cat("\nSampleIDs duplicados post-bridge:", n_dup,
+    if (n_dup > 0) " ← REVISAR antes de continuar" else " ✓ OK", "\n")
+
+
+# PCA post-normalización oficial de OlinkAnalyze
+OlinkAnalyze::olink_pca_plot(
+  df      = npx_after_br,
+  color_g = "Type",
+  byPanel = TRUE
+)
+
+# --- Scree plot por panel ---
+# El scree plot muestra cuánta varianza captura cada componente principal.
+# Se corre por separado para cada panel porque mezclarlos diluye la varianza
+
+panels_disponibles <- unique(npx_after_br$Panel)
+
+for (panel_name in panels_disponibles) {
+  
+  cat("\nGenerando scree plot para:", panel_name, "\n")
+  
+  # Filtrar y formatear por panel
+  npx_panel <- npx_after_br %>%
+    dplyr::filter(Panel == panel_name, !is.na(NPX)) %>%
+    dplyr::select(SampleID, Assay, NPX) %>%
+    tidyr::pivot_wider(names_from = Assay, values_from = NPX) %>%
+    tibble::column_to_rownames("SampleID")
+  
+  # Imputar NAs con la media de cada proteína
+  npx_panel <- npx_panel %>%
+    dplyr::mutate(across(everything(), ~ifelse(is.na(.), mean(., na.rm = TRUE), .)))
+  
+  # PCA con scale. = TRUE (consistente con olink_pca_plot)
+  pca_result <- prcomp(npx_panel, center = TRUE, scale. = TRUE)
+  
+  # Calcular varianza explicada por componente
+  var_explained <- (pca_result$sdev^2) / sum(pca_result$sdev^2) * 100
+  scree_df <- data.frame(PC = 1:20, Variance = var_explained[1:20])
+  
+  # Plot
+  p <- ggplot(scree_df, aes(x = PC, y = Variance)) +
+    geom_col(fill = "#4E79A7", alpha = 0.85, width = 0.7) +
+    geom_line(color = "black", linewidth = 0.8) +
+    geom_point(color = "black", size = 3) +
+    geom_text(aes(label = paste0(round(Variance, 1), "%")),
+              vjust = -0.8, size = 3.2) +
+    scale_x_continuous(breaks = 1:20) +
+    labs(
+      title = paste("Scree Plot —", panel_name, "(post-bridge)"),
+      x     = "Componentes principales",
+      y     = "Porcentaje de varianza explicada (%)"
+    ) +
+    theme_bw(base_size = 13) +
+    theme(panel.grid.minor = element_blank())
+  
+  print(p)
+}
+
+
+# =============================================================================
+# 6. FILTRADO DE PROTEÍNAS (LOD + SD)
+# =============================================================================
+# Antes de modelar, removemos proteínas con baja señal o poca variabilidad:
+#   - LOD: si >30% de las muestras están por debajo del límite de detección,
+#     la proteína tiene señal insuficiente para análisis estadístico.
+#   - SD: si la desviación estándar del NPX es <1.0, la proteína no muestra
+#     suficiente variabilidad biológica para detectar diferencias entre grupos.
+
+
+npx_final <- npx_br_data %>%
+  dplyr::filter(!(Project == "data2" & SampleID %in% bridge_samples_ids)) %>%
+  dplyr::select(-Project, -Adj_factor)
+
+cat("\nN total de proteínas antes del filtro:", n_distinct(npx_final$Assay), "\n")
+
+# --- Criterio 1: proporción de muestras bajo LOD ---
+lod_stats <- npx_final %>%
+  dplyr::group_by(Assay) %>%
+  dplyr::summarise(prop_below_lod = mean(NPX < LOD, na.rm = TRUE), .groups = "drop")
+
+# --- Criterio 2: desviación estándar del NPX ---
+sd_stats <- npx_final %>%
+  dplyr::group_by(Assay) %>%
+  dplyr::summarise(sd_npx = sd(NPX, na.rm = TRUE), .groups = "drop")
+
+# Aplicar umbrales
+proteinas_lod    <- lod_stats %>% dplyr::filter(prop_below_lod <= 0.30) %>% dplyr::pull(Assay)
+proteinas_sd     <- sd_stats  %>% dplyr::filter(sd_npx >= 1.0)          %>% dplyr::pull(Assay)
+proteinas_finales <- intersect(proteinas_lod, proteinas_sd)
+
+cat("Proteínas eliminadas por LOD >30%:", n_distinct(npx_final$Assay) - length(proteinas_lod), "\n")
+cat("Proteínas eliminadas por SD <1.0: ", length(proteinas_lod) - length(proteinas_finales), "\n")
+cat("Proteínas retenidas:              ", length(proteinas_finales), "\n")
+
+# Aplicar filtros
+npx_qc <- npx_final %>%
+  dplyr::filter(Assay %in% proteinas_finales)
+
+# --- Visualización del filtrado ---
+plot_filtrado <- sd_stats %>%
+  dplyr::left_join(lod_stats, by = "Assay") %>%
+  dplyr::mutate(
+    Estado = dplyr::case_when(
+      sd_npx < 1.0          ~ "Eliminada por SD",
+      prop_below_lod > 0.30 ~ "Eliminada por LOD",
+      TRUE                  ~ "Retenida"
+    )
+  )
+
+ggplot(plot_filtrado, aes(x = prop_below_lod, y = sd_npx, color = Estado)) +
+  geom_point(size = 2.5, alpha = 0.8) +
+  geom_hline(yintercept = 1.0,  linetype = "dashed", color = "#E53935", linewidth = 0.8) +
+  geom_vline(xintercept = 0.30, linetype = "dashed", color = "#1A237E", linewidth = 0.8) +
+  annotate("text", x = 0.01, y = 1.05, label = "SD = 1.0",  color = "#E53935", size = 3.5) +
+  annotate("text", x = 0.31, y = 0.8,  label = "LOD = 30%", color = "#1A237E", size = 3.5, angle = 90) +
+  scale_color_manual(values = c(
+    "Retenida"           = "#2196F3",
+    "Eliminada por SD"   = "#E53935",
+    "Eliminada por LOD"  = "#FF9800"
+  )) +
+  labs(
+    title = "Filtrado de proteínas post-normalización",
+    x     = "Proporción de muestras bajo LOD",
+    y     = "SD del NPX",
+    color = "Estado"
+  ) +
+  theme_bw() +
+  theme(legend.position = "top")
+
+
+# =============================================================================
+# 7. CONTROL DE CALIDAD DE MUESTRAS — DETECCIÓN DE OUTLIERS
+# =============================================================================
+# Identificamos muestras con comportamiento proteómico atípico usando el
+# criterio IQR: una medición de proteína es outlier si cae fuera de
+# mediana ± k*IQR, calculado POR proteína Y POR timepoint.
+# Una MUESTRA se considera outlier global si >20% de sus proteínas son outliers.
+
+# --- Funciones helper para detección IQR (basadas en metodología Olink) ---
+
+olink_iqr <- function(df, quant_col, iqr_group, iqr_sd) {
+  df %>%
+    dplyr::group_by(dplyr::pick(dplyr::all_of(iqr_group))) %>%
+    dplyr::mutate(iqr = IQR(x = .data[[quant_col]], na.rm = TRUE)) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(iqr_sd = .data[["iqr"]] * .env[["iqr_sd"]])
+}
+
+olink_median <- function(df, quant_col, median_group) {
+  df %>%
+    dplyr::group_by(dplyr::pick(dplyr::all_of(median_group))) %>%
+    dplyr::mutate(median = median(x = .data[[quant_col]], na.rm = TRUE)) %>%
+    dplyr::ungroup()
+}
+
+olink_median_iqr_outlier <- function(df, quant_col, group, iqr_sd) {
+  df %>%
+    olink_iqr(quant_col = quant_col, iqr_group = group, iqr_sd = iqr_sd) %>%
+    olink_median(quant_col = quant_col, median_group = group) %>%
+    dplyr::mutate(
+      is_outlier = dplyr::if_else(
+        .data[[quant_col]] < (.data[["median"]] - .data[["iqr_sd"]]) |
+          .data[[quant_col]] > (.data[["median"]] + .data[["iqr_sd"]]),
+        TRUE, FALSE
+      )
+    ) %>%
+    dplyr::pull(.data[["is_outlier"]])
+}
+
+# --- Aplicar detección de outliers ---
+IQR_K <- 3  # umbral estándar Olink (aumentar a 3.5 para criterio más permisivo)
+
+npx_outlier_flagged <- npx_qc %>%
+  dplyr::filter(!str_detect(SampleID, "CONTROL")) %>%
+  dplyr::mutate(
+    is_outlier_protein = olink_median_iqr_outlier(
+      df        = .,
+      quant_col = "NPX",
+      group     = c("OlinkID", "Time"),  # separado por timepoint
+      iqr_sd    = IQR_K
+    )
+  )
+
+# --- Resumen por muestra ---
+UMBRAL_PCT <- 20  # umbral para declarar una muestra como outlier global
+
+outlier_summary <- npx_outlier_flagged %>%
+  dplyr::group_by(SampleID) %>%
+  dplyr::summarise(
+    n_proteinas = n(),
+    n_outlier   = sum(is_outlier_protein, na.rm = TRUE),
+    pct_outlier = round(n_outlier / n_proteinas * 100, 2),
+    median_NPX  = round(median(NPX, na.rm = TRUE), 3),
+    .groups     = "drop"
+  ) %>%
+  dplyr::arrange(desc(pct_outlier)) %>%
+  dplyr::mutate(
+    es_outlier = ifelse(pct_outlier > UMBRAL_PCT, "Outlier", "Normal"),
+    es_outlier = factor(es_outlier, levels = c("Normal", "Outlier"))
+  )
+
+muestras_outlier <- outlier_summary %>%
+  dplyr::filter(pct_outlier > UMBRAL_PCT) %>%
+  dplyr::pull(SampleID)
+
+cat(sprintf("\nMuestras con >%d%% proteínas fuera de rango (k=%d×IQR): %d\n",
+            UMBRAL_PCT, IQR_K, length(muestras_outlier)))
+if (length(muestras_outlier) > 0) cat("SampleIDs:", paste(muestras_outlier, collapse = ", "), "\n")
+
+# --- Visualización de outliers ---
+ggplot(outlier_summary, aes(x = es_outlier, y = pct_outlier, fill = es_outlier)) +
+  geom_violin(alpha = 0.6, trim = FALSE) +
+  geom_jitter(width = 0.15, size = 2, alpha = 0.7, aes(color = es_outlier)) +
+  geom_hline(yintercept = UMBRAL_PCT, linetype = "dashed", color = "gray40") +
+  scale_fill_manual(values  = c("Normal" = "#2196F3", "Outlier" = "#E53935")) +
+  scale_color_manual(values = c("Normal" = "#1565C0", "Outlier" = "#B71C1C")) +
+  labs(
+    title = paste0("Distribución de % proteínas outlier por muestra (umbral: ", UMBRAL_PCT, "%)"),
+    x     = NULL,
+    y     = "% proteínas fuera de rango (mediana ± 3×IQR)"
+  ) +
+  theme_bw() +
+  theme(legend.position = "none")
+
+
+# =============================================================================
+# 8. EXPLORACIÓN ADICIONAL: UMAP Y ESTRUCTURA DE DATOS
+# =============================================================================
+
+# --- Estructura de variables para modelado ---
+cat("\n=== Verificación del diseño experimental ===\n")
+cat("Columnas disponibles:", paste(colnames(npx_qc), collapse = ", "), "\n")
+
+cat("\nNiveles de Treatment:\n")
+print(npx_qc %>% dplyr::distinct(Treatment) %>% dplyr::filter(!is.na(Treatment)))
+
+cat("\nCombinaciones Site × Time:\n")
+print(npx_qc %>% dplyr::distinct(Site, Time))
+
+cat("\nMedidas por sujeto (esperado: 3 = Baseline, Week.6, Week.12):\n")
+npx_qc %>%
+  dplyr::filter(!is.na(Subject)) %>%
+  dplyr::distinct(Subject, Time) %>%
+  dplyr::count(Subject) %>%
+  dplyr::count(n, name = "n_sujetos") %>%
+  print()
+
+
+# --- UMAP por tratamiento ---
+npx_qc %>%
+  dplyr::filter(!is.na(Treatment)) %>%
+  dplyr::filter(!str_detect(SampleID, "CONTROL")) %>%
+  olink_umap_plot(color_g = "Treatment", byPanel = TRUE)
+
+# UMAP por timepoint: visualizar si hay separación temporal
+npx_qc %>%
+  dplyr::filter(!is.na(Time)) %>%
+  dplyr::filter(!str_detect(SampleID, "CONTROL")) %>%
+  olink_umap_plot(color_g = "Time", byPanel = TRUE)
+
+
+# =============================================================================
+# 9. EXPRESIÓN DIFERENCIAL
+# =============================================================================
+
+npx_model <- npx_qc %>%
+  dplyr::filter(!str_detect(SampleID, "CONTROL")) %>%
+  dplyr::filter(!is.na(Treatment), !is.na(Subject), !is.na(Site), !is.na(Time)) %>%
+  dplyr::mutate(
+    Treatment = factor(Treatment, levels = c("Untreated", "Treated")),  # Untreated = referencia
+    Time      = factor(Time,      levels = c("Baseline", "Week.6", "Week.12")),
+    Site      = factor(Site)
+  )
+
+cat("\nN sujetos en modelo:", n_distinct(npx_model$Subject), "\n")
+cat("N proteínas en modelo:", n_distinct(npx_model$OlinkID), "\n")
+
+# --- Modelo 1: t-test simple ---
+# Fórmula implícita: NPX ~ Treatment
+# Propósito: baseline rápido para comparar con modelos más complejos.
+# Limitación: ignora la estructura longitudinal y el efecto de sitio.
+# NO es el modelo recomendado para este diseño; se incluye solo como referencia.
+Modelo_1 <- olink_ttest(df = npx_model, variable = "Treatment")
+
+cat("\nModelo 1 (t-test, solo referencia):\n")
+cat("Proteínas significativas (FDR<0.05):", sum(Modelo_1$Adjusted_pval < 0.05, na.rm = TRUE), "\n")
+
+
+# --- Modelo 2: LMM ajustado por sitio ---
+# Fórmula: NPX ~ Treatment + Site + (1|Subject)
+# Subject como efecto aleatorio: captura la correlación entre medidas repetidas del mismo sujeto.
+# Site como covariable fija: controla diferencias sistemáticas entre centros de reclutamiento.
+# Aplica cuando el interés principal es el efecto de Treatment sin modelar su cambio en el tiempo.
+Modelo_2 <- olink_lmer(
+  df         = npx_model,
+  variable   = "Treatment",
+  random     = "Subject",
+  covariates = "Site"
+)
+
+cat("\nModelo 2 (LMM + Site, efecto Treatment):\n")
+cat("Términos en el modelo:", paste(unique(Modelo_2$term), collapse = ", "), "\n")
+cat("Proteínas significativas (FDR<0.05):", sum(Modelo_2$Adjusted_pval < 0.05, na.rm = TRUE), "\n")
+
+# Verificar warnings de convergencia Modelo 2
+n_fallos_m2 <- Modelo_2 %>% dplyr::filter(is.na(statistic)) %>% nrow()
+cat("Modelo 2 — proteínas sin ajuste (statistic = NA):", n_fallos_m2, "\n")
+
+
+
+# --- Modelo 3: LMM longitudinal completo (RECOMENDADO) ---
+# Fórmula: NPX ~ Treatment * Time + Site + (1|Subject)
+#   - Treatment: ¿difieren los grupos en promedio a lo largo de todos los timepoints?
+#   - Time: ¿cambian las proteínas con el tiempo independientemente del tratamiento?
+#   - Treatment:Time: ¿el efecto del tratamiento difiere según el momento de la visita?
+#     Esta interacción es biológicamente la más interesante.
+#   - (1|Subject): cada sujeto tiene su propio intercepto aleatorio.
+Modelo_3 <- olink_lmer(
+  df         = npx_model,
+  variable   = c("Treatment", "Time"),  # OlinkAnalyze infiere la interacción automáticamente
+  random     = "Subject",
+  covariates = "Site"
+)
+
+cat("\nModelo 3 (LMM longitudinal completo — RECOMENDADO):\n")
+cat("Proteínas significativas por término:\n")
+Modelo_3 %>%
+  dplyr::filter(Adjusted_pval < 0.05) %>%
+  dplyr::count(term, name = "n_significativas") %>%
+  print()
+
+# Verificar warnings de convergencia
+n_fallos_m3 <- Modelo_3 %>% dplyr::filter(is.na(statistic)) %>% nrow()
+cat("Modelo 3 — proteínas sin ajuste (statistic = NA):", n_fallos_m3, "\n")
+
+
+
+# --- Extraer proteínas significativas por modelo y término ---
+sig_M2_treatment <- Modelo_2 %>%
+  dplyr::filter(Adjusted_pval < 0.05, term == "Treatment") %>%
+  dplyr::arrange(Adjusted_pval)
+
+sig_M3_treatment <- Modelo_3 %>%
+  dplyr::filter(Adjusted_pval < 0.05, term == "Treatment") %>%
+  dplyr::arrange(Adjusted_pval)
+
+sig_M3_interaccion <- Modelo_3 %>%
+  dplyr::filter(Adjusted_pval < 0.05, str_detect(term, "Treatment:Time")) %>%
+  dplyr::arrange(Adjusted_pval)
+
+
+# =============================================================================
+# 10. EXPORTACIÓN DE DATOS
+# =============================================================================
+# Removemos columnas internas (Project, Adj_factor) antes de exportar.
+new_normalized_data <- npx_br_data %>%
+  dplyr::filter(Project == "data2") %>%
+  dplyr::select(-Project, -Adj_factor)
+
+write.table(new_normalized_data,
+            file      = "New_Normalized_NPX_data.csv",
+            sep       = ";",
+            row.names = FALSE)
+
+cat("\nArchivo exportado: New_Normalized_NPX_data.csv\n")
+cat("Dimensiones:", dim(new_normalized_data), "\n")
+
+# Contiene todas las muestras (data1 + data2 únicas) con proteínas filtradas por LOD y SD
+write.table(npx_qc,
+            file      = "NPX_QC_final.csv",
+            sep       = ";",
+            row.names = FALSE)
+
+cat("Archivo exportado: NPX_QC_final.csv\n")
+cat("Dimensiones:", dim(npx_qc), "\n")
+
+# --- Resultados de modelos estadísticos ---
+write.table(Modelo_3,
+            file      = "Modelo3_LMM_resultados.csv",
+            sep       = ";",
+            row.names = FALSE)
+
+
